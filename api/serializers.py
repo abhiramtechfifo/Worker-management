@@ -7,7 +7,8 @@ class WorkerSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Worker
-        fields = '__all__'
+        fields = ['id', 'name', 'phone', 'role', 'is_active', 'status']
+        read_only_fields = ['status', 'is_active']
 
     def get_status(self, obj):
         # If worker is explicitly deactivated (on leave), status is UNAVAILABLE
