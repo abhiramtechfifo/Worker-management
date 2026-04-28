@@ -27,7 +27,9 @@ SECRET_KEY = os.environ.get('SECRET_KEY', 'django-insecure-8y@%=s5--$0s+9de!9qr3
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = os.environ.get('DEBUG', 'True') == 'True'
 
-ALLOWED_HOSTS = ['localhost', '127.0.0.1', '.render.com']
+ALLOWED_HOSTS = ['*']
+CSRF_TRUSTED_ORIGINS = ['http://localhost:5173', 'https://*.onrender.com']
+SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
 
 
 # Application definition
