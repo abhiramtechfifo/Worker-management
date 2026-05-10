@@ -2,46 +2,81 @@ from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from django.db.models import Sum
-from .models import Worker, Owner, Assignment, Payment
-from .serializers import WorkerSerializer, OwnerSerializer, AssignmentSerializer, PaymentSerializer
+from .models import Worker, Owner, Assignment, Payment, OwnerPayment
+from .serializers import WorkerSerializer, OwnerSerializer, AssignmentSerializer, PaymentSerializer, OwnerPaymentSerializer
 from django.utils import timezone
 
 class WorkerViewSet(viewsets.ModelViewSet):
-    queryset = Worker.objects.all()
     serializer_class = WorkerSerializer
+
+    def get_queryset(self):
+        return Worker.objects.filter(is_deleted=False)
+
+    def _auto_reset_workers(self):
+        """After 4 AM IST each day, reset workers whose leave was set on a previous date."""
+        now_ist = timezone.localtime(timezone.now())
+        today_ist = now_ist.date()
+        if now_ist.hour >= 4:
+            Worker.objects.filter(
+                is_active=False,
+                is_deleted=False,
+                leave_date__lt=today_ist
+            ).update(is_active=True, status='AVAILABLE', leave_date=None)
+
+    def list(self, request, *args, **kwargs):
+        self._auto_reset_workers()
+        return super().list(request, *args, **kwargs)
+
+    def destroy(self, request, *args, **kwargs):
+        worker = self.get_object()
+        worker.is_deleted = True
+        worker.save()
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
     @action(detail=True, methods=['post'])
     def toggle_active(self, request, pk=None):
         """Toggle worker active/leave status."""
         worker = self.get_object()
         worker.is_active = not worker.is_active
-        # If going on leave, status is UNAVAILABLE. If coming back, status is AVAILABLE.
+        # If going on leave, record today's IST date and mark UNAVAILABLE.
+        # If coming back, clear leave_date and mark AVAILABLE.
         if not worker.is_active:
             worker.status = 'UNAVAILABLE'
+            worker.leave_date = timezone.localdate()
         else:
             worker.status = 'AVAILABLE'
+            worker.leave_date = None
         worker.save()
         return Response({'id': worker.id, 'is_active': worker.is_active})
 
 class OwnerViewSet(viewsets.ModelViewSet):
-    queryset = Owner.objects.all()
     serializer_class = OwnerSerializer
+
+    def get_queryset(self):
+        return Owner.objects.filter(is_deleted=False)
+
+    def destroy(self, request, *args, **kwargs):
+        owner = self.get_object()
+        owner.is_deleted = True
+        owner.save()
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
     @action(detail=True, methods=['get'])
     def details(self, request, pk=None):
         owner = self.get_object()
         date_filter = request.query_params.get('date', None)
 
-        assignments = Assignment.objects.filter(owner=owner)
-        if date_filter:
-            assignments = assignments.filter(date=date_filter)
+        all_assignments = Assignment.objects.filter(owner=owner)
+        display_assignments = all_assignments.filter(date=date_filter) if date_filter else all_assignments
 
-        serializer = AssignmentSerializer(assignments, many=True)
+        serializer = AssignmentSerializer(display_assignments, many=True)
 
-        total_work_amount = assignments.aggregate(Sum('amount'))['amount__sum'] or 0
-        total_paid = Payment.objects.filter(assignment__in=assignments).aggregate(
-            Sum('amount_paid'))['amount_paid__sum'] or 0
+        # Totals are always all-time — owner pays in bulk regardless of date
+        total_work_amount = all_assignments.aggregate(Sum('amount'))['amount__sum'] or 0
+        total_paid = OwnerPayment.objects.filter(owner=owner).aggregate(Sum('amount'))['amount__sum'] or 0
         total_pending = max(0, float(total_work_amount) - float(total_paid))
+
+        payment_history = OwnerPayment.objects.filter(owner=owner).order_by('-date', '-id')
 
         return Response({
             'owner': OwnerSerializer(owner).data,
@@ -50,8 +85,23 @@ class OwnerViewSet(viewsets.ModelViewSet):
                 'total_work_amount': total_work_amount,
                 'total_paid': total_paid,
                 'total_pending': total_pending
-            }
+            },
+            'payment_history': OwnerPaymentSerializer(payment_history, many=True).data
         })
+
+    @action(detail=True, methods=['post'])
+    def collect_payment(self, request, pk=None):
+        """Record an owner-level payment of any amount."""
+        owner = self.get_object()
+        amount = request.data.get('amount')
+        note = request.data.get('note', '')
+        if not amount:
+            return Response({'error': 'Amount is required.'}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            payment = OwnerPayment.objects.create(owner=owner, amount=float(amount), note=note)
+            return Response(OwnerPaymentSerializer(payment).data, status=status.HTTP_201_CREATED)
+        except (ValueError, TypeError):
+            return Response({'error': 'Invalid amount.'}, status=status.HTTP_400_BAD_REQUEST)
 
 class AssignmentViewSet(viewsets.ModelViewSet):
     queryset = Assignment.objects.all().order_by('-date', '-id')
@@ -141,19 +191,19 @@ class ReportViewSet(viewsets.ViewSet):
         grass_cutter_works = assignments.filter(work_type='GRASS_CUTTER').count()
         total_earnings = assignments.aggregate(Sum('amount'))['amount__sum'] or 0
 
-        collected_amount = Payment.objects.filter(
-            assignment__date=date_str).aggregate(Sum('amount_paid'))['amount_paid__sum'] or 0
+        collected_amount = OwnerPayment.objects.filter(
+            date=date_str).aggregate(Sum('amount'))['amount__sum'] or 0
         pending_amount = max(0, float(total_earnings) - float(collected_amount))
 
-        owners = Owner.objects.all()
+        owners = Owner.objects.filter(is_deleted=False)
         owner_summary = []
         for owner in owners:
             oa = assignments.filter(owner=owner)
             if oa.exists():
                 work_amt = oa.aggregate(Sum('amount'))['amount__sum'] or 0
-                paid_amt = Payment.objects.filter(
-                    assignment__owner=owner, assignment__date=date_str
-                ).aggregate(Sum('amount_paid'))['amount_paid__sum'] or 0
+                paid_amt = OwnerPayment.objects.filter(
+                    owner=owner, date=date_str
+                ).aggregate(Sum('amount'))['amount__sum'] or 0
                 owner_summary.append({
                     'owner_name': owner.name,
                     'worker_count': oa.count(),

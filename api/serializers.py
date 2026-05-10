@@ -1,5 +1,5 @@
 from rest_framework import serializers
-from .models import Worker, Owner, Assignment, Payment
+from .models import Worker, Owner, Assignment, Payment, OwnerPayment
 from django.utils import timezone
 
 class WorkerSerializer(serializers.ModelSerializer):
@@ -15,8 +15,8 @@ class WorkerSerializer(serializers.ModelSerializer):
         if not obj.is_active:
             return 'UNAVAILABLE'
         
-        # Check if worker has any active assignment for TODAY
-        today = timezone.now().date()
+        # Check if worker has any active assignment for TODAY (IST date)
+        today = timezone.localdate()
         has_active_assignment = obj.assignments.filter(date=today, is_active=True).exists()
         
         if has_active_assignment:
@@ -36,8 +36,8 @@ class OwnerSerializer(serializers.ModelSerializer):
         fields = ['id', 'name', 'phone', 'address', 'assigned_workers_count', 'total_work_amount', 'total_paid', 'total_pending']
 
     def get_assigned_workers_count(self, obj):
-        # Only count active assignments for TODAY
-        today = timezone.now().date()
+        # Only count active assignments for TODAY (IST date)
+        today = timezone.localdate()
         return obj.assignments.filter(date=today, is_active=True).count()
 
     def get_total_work_amount(self, obj):
@@ -46,7 +46,7 @@ class OwnerSerializer(serializers.ModelSerializer):
 
     def get_total_paid(self, obj):
         from django.db.models import Sum
-        return Payment.objects.filter(assignment__owner=obj).aggregate(Sum('amount_paid'))['amount_paid__sum'] or 0
+        return obj.owner_payments.aggregate(Sum('amount'))['amount__sum'] or 0
 
     def get_total_pending(self, obj):
         work = float(self.get_total_work_amount(obj))
@@ -64,4 +64,9 @@ class AssignmentSerializer(serializers.ModelSerializer):
 class PaymentSerializer(serializers.ModelSerializer):
     class Meta:
         model = Payment
+        fields = '__all__'
+
+class OwnerPaymentSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = OwnerPayment
         fields = '__all__'
