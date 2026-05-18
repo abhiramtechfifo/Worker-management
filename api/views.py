@@ -183,43 +183,83 @@ class PaymentViewSet(viewsets.ModelViewSet):
 
 class ReportViewSet(viewsets.ViewSet):
     def list(self, request):
-        date_str = request.query_params.get('date', timezone.now().date().isoformat())
-        assignments = Assignment.objects.filter(date=date_str)
+        """
+        Reports filter:
+          ?period=day&date=YYYY-MM-DD     (default; uses today if date missing)
+          ?period=month&month=YYYY-MM
+          ?period=year&year=YYYY
+        Returns summary, per-owner summary, detailed assignments, and payments
+        for the chosen period.
+        """
+        period = (request.query_params.get('period') or 'day').lower()
+        today = timezone.localdate()
 
-        total_works = assignments.count()
-        kooli_works = assignments.filter(work_type='KOOLI').count()
-        grass_cutter_works = assignments.filter(work_type='GRASS_CUTTER').count()
-        total_earnings = assignments.aggregate(Sum('amount'))['amount__sum'] or 0
+        assignments_qs = Assignment.objects.all()
+        payments_qs = OwnerPayment.objects.all()
 
-        collected_amount = OwnerPayment.objects.filter(
-            date=date_str).aggregate(Sum('amount'))['amount__sum'] or 0
+        if period == 'month':
+            month_str = request.query_params.get('month') or today.strftime('%Y-%m')
+            try:
+                year, month = month_str.split('-')
+                year, month = int(year), int(month)
+            except (ValueError, AttributeError):
+                return Response({'error': 'Invalid month. Expected YYYY-MM.'}, status=status.HTTP_400_BAD_REQUEST)
+            assignments_qs = assignments_qs.filter(date__year=year, date__month=month)
+            payments_qs = payments_qs.filter(date__year=year, date__month=month)
+            period_label = month_str
+        elif period == 'year':
+            year_str = request.query_params.get('year') or str(today.year)
+            try:
+                year = int(year_str)
+            except (ValueError, TypeError):
+                return Response({'error': 'Invalid year.'}, status=status.HTTP_400_BAD_REQUEST)
+            assignments_qs = assignments_qs.filter(date__year=year)
+            payments_qs = payments_qs.filter(date__year=year)
+            period_label = str(year)
+        else:
+            period = 'day'
+            date_str = request.query_params.get('date') or today.isoformat()
+            assignments_qs = assignments_qs.filter(date=date_str)
+            payments_qs = payments_qs.filter(date=date_str)
+            period_label = date_str
+
+        assignments_qs = assignments_qs.order_by('date', 'id')
+        payments_qs = payments_qs.order_by('date', 'id')
+
+        total_works = assignments_qs.count()
+        kooli_works = assignments_qs.filter(work_type='KOOLI').count()
+        grass_cutter_works = assignments_qs.filter(work_type='GRASS_CUTTER').count()
+        total_earnings = assignments_qs.aggregate(Sum('amount'))['amount__sum'] or 0
+        collected_amount = payments_qs.aggregate(Sum('amount'))['amount__sum'] or 0
         pending_amount = max(0, float(total_earnings) - float(collected_amount))
 
-        owners = Owner.objects.filter(is_deleted=False)
+        # Owner-wise breakdown for the same period.
         owner_summary = []
-        for owner in owners:
-            oa = assignments.filter(owner=owner)
-            if oa.exists():
-                work_amt = oa.aggregate(Sum('amount'))['amount__sum'] or 0
-                paid_amt = OwnerPayment.objects.filter(
-                    owner=owner, date=date_str
-                ).aggregate(Sum('amount'))['amount__sum'] or 0
-                owner_summary.append({
-                    'owner_name': owner.name,
-                    'worker_count': oa.count(),
-                    'total_work_amount': work_amt,
-                    'paid_amount': paid_amt,
-                    'pending_amount': max(0, float(work_amt) - float(paid_amt))
-                })
+        owner_ids = list(assignments_qs.values_list('owner', flat=True).distinct())
+        for owner in Owner.objects.filter(id__in=owner_ids, is_deleted=False):
+            oa = assignments_qs.filter(owner=owner)
+            work_amt = oa.aggregate(Sum('amount'))['amount__sum'] or 0
+            paid_amt = payments_qs.filter(owner=owner).aggregate(Sum('amount'))['amount__sum'] or 0
+            owner_summary.append({
+                'owner_name': owner.name,
+                'worker_count': oa.count(),
+                'total_work_amount': work_amt,
+                'paid_amount': paid_amt,
+                'pending_amount': max(0, float(work_amt) - float(paid_amt))
+            })
 
         return Response({
+            'period': period,
+            'period_label': period_label,
             'summary': {
                 'total_works': total_works,
                 'kooli_works': kooli_works,
                 'grass_cutter_works': grass_cutter_works,
                 'total_earnings': total_earnings,
                 'collected_amount': collected_amount,
-                'pending_amount': pending_amount
+                'pending_amount': pending_amount,
             },
-            'owner_summary': owner_summary
+            'owner_summary': owner_summary,
+            'assignments': AssignmentSerializer(assignments_qs, many=True).data,
+            'payments': OwnerPaymentSerializer(payments_qs, many=True).data,
         })
